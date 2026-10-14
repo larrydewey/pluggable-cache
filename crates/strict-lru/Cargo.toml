@@ -5,5 +5,6 @@ edition = "2021"
 rust-version = "1.85"
 description = "A small, dependency-free, strict LRU cache with optional TTL and weight bounds"
 license = "Apache-2.0"
+authors = ["Larry Dewey <larrydewey@proton.me>"]
 repository = "https://github.com/larrydewey/pluggable-cache"
 readme = "README.md"

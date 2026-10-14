@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 description = "Pluggable, namespaced caches with an LRU core, persistent backends and signed OCI preload bundles"
 license = "Apache-2.0"
+authors = ["Larry Dewey <larrydewey@proton.me>"]
 repository = "https://github.com/larrydewey/pluggable-cache"
 readme = "README.md"
 
@@ -25,7 +26,7 @@ serde_json = { version = "1.0.150", optional = true }
 sha2 = { version = "0.11", optional = true }
 strict-lru = { version = "0.1.0", path = "../strict-lru" }
 thiserror = "2.0"
-tokio = { version = "1", default-features = false, features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1", default-features = false, features = ["fs", "rt", "sync", "time", "macros"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
