@@ -4,7 +4,7 @@
 
 //! On-demand provider for namespaced caches.
 //!
-//! Mirrors `key_value_storage::StorageProvider`: a component is handed a
+//! A component is handed a
 //! [`CacheProvider`] and mints the namespace it needs, e.g.
 //!
 //! ```ignore
@@ -24,12 +24,9 @@ use async_trait::async_trait;
 use tokio::sync::{OnceCell, RwLock};
 use tracing::{debug, error, info, warn};
 
-#[cfg(feature = "persistent")]
-use key_value_storage::StorageProvider;
-
 use crate::{
-    disabled::DisabledCache, memory::MemoryCache, preload::PreloadSource, BackendConfig,
-    CacheConfig, CacheError, CacheInstance, CacheType, Result,
+    disabled::DisabledCache, memory::MemoryCache, preload::PreloadSource, store::ByteStoreProvider,
+    BackendConfig, CacheConfig, CacheError, CacheInstance, CacheType, Result,
 };
 
 /// Mints namespaced cache instances on demand.
@@ -50,8 +47,7 @@ pub trait CacheProvider: Send + Sync {
 /// [`CacheConfig`].
 pub struct ConfiguredCacheProvider {
     config: CacheConfig,
-    #[cfg(feature = "persistent")]
-    storage: Option<Arc<dyn StorageProvider>>,
+    storage: Option<Arc<dyn ByteStoreProvider>>,
     preload: Vec<Arc<dyn PreloadSource>>,
     /// One cell per namespace, so that building and preloading one namespace
     /// never blocks lookups of others.
@@ -77,26 +73,20 @@ impl ConfiguredCacheProvider {
     /// background task purges expired entries until the provider is dropped.
     pub fn new(
         config: CacheConfig,
-        #[cfg(feature = "persistent")] storage: Option<Arc<dyn StorageProvider>>,
+        storage: Option<Arc<dyn ByteStoreProvider>>,
     ) -> Result<Arc<Self>> {
-        Self::with_preload_sources(
-            config,
-            #[cfg(feature = "persistent")]
-            storage,
-            Vec::new(),
-        )
+        Self::with_preload_sources(config, storage, Vec::new())
     }
 
     /// Like [`ConfiguredCacheProvider::new`], with `extra` preload sources
     /// applied after those in the configuration.
     pub fn with_preload_sources(
         config: CacheConfig,
-        #[cfg(feature = "persistent")] storage: Option<Arc<dyn StorageProvider>>,
+        storage: Option<Arc<dyn ByteStoreProvider>>,
         extra: Vec<Arc<dyn PreloadSource>>,
     ) -> Result<Arc<Self>> {
         config.validate()?;
 
-        #[cfg(feature = "persistent")]
         {
             let needs_storage = std::iter::once(&config.default)
                 .chain(config.namespaces.values())
@@ -105,6 +95,17 @@ impl ConfiguredCacheProvider {
                 return Err(CacheError::InvalidConfiguration {
                     message: "persistent and tiered caches need a storage provider".into(),
                 });
+            }
+        }
+        if let Some(storage) = &storage {
+            for backend in std::iter::once(&config.default).chain(config.namespaces.values()) {
+                let uses_storage = matches!(
+                    backend.cache_type,
+                    CacheType::Persistent | CacheType::Tiered
+                );
+                if let (true, Some(name)) = (uses_storage, &backend.persistent.storage_type) {
+                    storage.validate_backend(name)?;
+                }
             }
         }
 
@@ -117,7 +118,6 @@ impl ConfiguredCacheProvider {
 
         let provider = Arc::new(Self {
             config,
-            #[cfg(feature = "persistent")]
             storage,
             preload,
             instances: RwLock::new(BTreeMap::new()),
@@ -171,24 +171,14 @@ impl ConfiguredCacheProvider {
         Ok(match backend.cache_type {
             CacheType::Memory => Arc::new(MemoryCache::new(&backend.memory)?),
             CacheType::Disabled => Arc::new(DisabledCache),
-            #[cfg(feature = "persistent")]
             CacheType::Persistent => Arc::new(self.persistent(namespace, backend).await?),
-            #[cfg(feature = "persistent")]
             CacheType::Tiered => Arc::new(crate::tiered::TieredCache::new(
                 MemoryCache::new(&backend.memory)?,
                 self.persistent(namespace, backend).await?,
             )),
-            #[cfg(not(feature = "persistent"))]
-            CacheType::Persistent | CacheType::Tiered => {
-                let _ = namespace;
-                return Err(CacheError::InvalidConfiguration {
-                    message: "persistent caches require the `persistent` feature".into(),
-                });
-            }
         })
     }
 
-    #[cfg(feature = "persistent")]
     async fn persistent(
         &self,
         namespace: &str,
@@ -202,17 +192,12 @@ impl ConfiguredCacheProvider {
             })?;
         let storage_namespace =
             format!("{}{namespace}", crate::persistent::STORAGE_NAMESPACE_PREFIX);
-        let storage = match backend.persistent.storage_type {
-            Some(storage_type) => {
-                storage
-                    .get_or_register_with_type(&storage_namespace, storage_type)
-                    .await
-            }
-            None => storage.get_or_register(&storage_namespace).await,
-        }
-        .map_err(|e| CacheError::Backend {
-            source: Box::new(e),
-        })?;
+        let storage = storage
+            .get_or_register(
+                &storage_namespace,
+                backend.persistent.storage_type.as_deref(),
+            )
+            .await?;
         crate::persistent::PersistentCache::new(storage, &backend.persistent)
     }
 
@@ -314,7 +299,7 @@ pub fn validate_namespace(namespace: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{memory, preload, CacheKey};
+    use crate::{memory, preload, store::MemoryByteStoreProvider, CacheKey};
     use std::path::PathBuf;
 
     fn key(k: &str) -> CacheKey {
@@ -322,11 +307,7 @@ mod tests {
     }
 
     fn new_provider(config: CacheConfig) -> Result<Arc<ConfiguredCacheProvider>> {
-        ConfiguredCacheProvider::new(
-            config,
-            #[cfg(feature = "persistent")]
-            None,
-        )
+        ConfiguredCacheProvider::new(config, None)
     }
 
     fn memory_provider(preload_dir: Option<PathBuf>) -> Arc<ConfiguredCacheProvider> {
@@ -404,7 +385,6 @@ mod tests {
         assert!(new_provider(config).is_err());
     }
 
-    #[cfg(feature = "persistent")]
     #[test]
     fn persistent_requires_storage() {
         let config = CacheConfig {
@@ -463,7 +443,6 @@ mod tests {
     async fn custom_preload_source() {
         let provider = ConfiguredCacheProvider::with_preload_sources(
             CacheConfig::default(),
-            #[cfg(feature = "persistent")]
             None,
             vec![Arc::new(StaticSource)],
         )
@@ -472,15 +451,9 @@ mod tests {
         assert_eq!(cache.get(&key("from")).await.unwrap(), Some(b"ns".to_vec()));
     }
 
-    #[cfg(feature = "persistent")]
     #[tokio::test]
     async fn persistent_and_tiered_namespaces() {
-        use key_value_storage::{KeyValueStorageStructConfig, KvStorageProvider};
-
-        let storage = KvStorageProvider::new(key_value_storage::StorageBackendConfig {
-            storage_type: key_value_storage::KeyValueStorageType::Memory,
-            backends: KeyValueStorageStructConfig::default(),
-        });
+        let storage = Arc::new(MemoryByteStoreProvider::default());
         let mut config = CacheConfig {
             default: BackendConfig {
                 cache_type: CacheType::Tiered,
@@ -501,36 +474,51 @@ mod tests {
             let cache = provider.get_or_register(namespace).await.unwrap();
             cache.set(&key("k"), b"v".to_vec()).await.unwrap();
             let backing = storage
-                .get_or_register(&format!("cache_{namespace}"))
+                .get_or_register(&format!("cache_{namespace}"), None)
                 .await
                 .unwrap();
             assert_eq!(backing.list().await.unwrap(), ["k"]);
         }
     }
 
-    #[cfg(feature = "persistent")]
+    #[test]
+    fn unknown_storage_backend_is_rejected_at_construction() {
+        let config = CacheConfig {
+            default: BackendConfig {
+                cache_type: CacheType::Persistent,
+                persistent: crate::persistent::Config {
+                    storage_type: Some("nonsense".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let storage = Arc::new(MemoryByteStoreProvider::default());
+        assert!(matches!(
+            ConfiguredCacheProvider::new(config, Some(storage)),
+            Err(CacheError::InvalidConfiguration { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn unavailable_backend_falls_back_to_disabled() {
-        use key_value_storage::{KeyValueStorageInstance, KeyValueStorageType, Result as KvResult};
-
         struct Unreachable;
 
         #[async_trait]
-        impl StorageProvider for Unreachable {
-            async fn get_or_register(&self, _: &str) -> KvResult<KeyValueStorageInstance> {
-                Err(
-                    key_value_storage::KeyValueStorageError::InvalidConfiguration {
-                        message: "down".into(),
-                    },
-                )
+        impl ByteStoreProvider for Unreachable {
+            fn validate_backend(&self, _: &str) -> Result<()> {
+                Ok(())
             }
 
-            async fn get_or_register_with_type(
+            async fn get_or_register(
                 &self,
-                namespace: &str,
-                _: KeyValueStorageType,
-            ) -> KvResult<KeyValueStorageInstance> {
-                self.get_or_register(namespace).await
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<crate::store::ByteStoreInstance> {
+                Err(CacheError::Backend {
+                    source: "down".into(),
+                })
             }
         }
 

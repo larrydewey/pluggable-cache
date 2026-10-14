@@ -111,15 +111,15 @@ impl Cache for TieredCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{ByteStoreInstance, MemoryByteStore};
     use crate::{memory, persistent};
-    use key_value_storage::{memory::MemoryKeyValueStorage, KeyValueStorageInstance};
     use std::sync::Arc;
 
     fn key(k: &str) -> CacheKey {
         CacheKey::new(k).unwrap()
     }
 
-    fn tiered(storage: KeyValueStorageInstance) -> TieredCache {
+    fn tiered(storage: ByteStoreInstance) -> TieredCache {
         TieredCache::new(
             MemoryCache::new(&memory::Config::default()).unwrap(),
             PersistentCache::new(storage, &persistent::Config::default()).unwrap(),
@@ -128,7 +128,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_through_and_promote() {
-        let storage: KeyValueStorageInstance = Arc::new(MemoryKeyValueStorage::default());
+        let storage: ByteStoreInstance = Arc::new(MemoryByteStore::default());
         let first = tiered(storage.clone());
         first.set(&key("a"), b"v".to_vec()).await.unwrap();
 
@@ -145,7 +145,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_both_tiers() {
-        let storage: KeyValueStorageInstance = Arc::new(MemoryKeyValueStorage::default());
+        let storage: ByteStoreInstance = Arc::new(MemoryByteStore::default());
         let cache = tiered(storage.clone());
         cache.set(&key("a"), b"v".to_vec()).await.unwrap();
         assert_eq!(cache.delete(&key("a")).await.unwrap(), Some(b"v".to_vec()));

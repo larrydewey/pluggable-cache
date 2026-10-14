@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Persistent cache backend on top of any `key-value-storage` backend.
+//! Persistent cache backend on top of any [`crate::store::ByteStore`].
 //!
 //! Entries survive restarts and, with a shared storage backend such as
 //! PostgreSQL or Redis, are shared between replicas. The storage has no notion
@@ -17,26 +17,27 @@ use std::{
 };
 
 use async_trait::async_trait;
-use key_value_storage::{KeyValueStorageInstance, KeyValueStorageType, SetParameters};
 use serde::Deserialize;
 use tracing::{instrument, warn};
 
 use crate::{
-    Cache, CacheError, CacheKey, CacheStats, Result, DEFAULT_MAX_VALUE_BYTES, DEFAULT_TTL_SECS,
+    store::ByteStoreInstance, Cache, CacheError, CacheKey, CacheStats, Result,
+    DEFAULT_MAX_VALUE_BYTES, DEFAULT_TTL_SECS,
 };
 
 const ENVELOPE_MAGIC: &[u8; 4] = b"TCE1";
 const ENVELOPE_HEADER_LEN: usize = ENVELOPE_MAGIC.len() + 8;
 
-/// Prefix of the key-value storage namespace backing a cache namespace.
+/// Prefix of the storage namespace backing a cache namespace.
 pub const STORAGE_NAMESPACE_PREFIX: &str = "cache_";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Storage backend to keep entries in. `None` uses the storage provider's
-    /// default backend.
-    pub storage_type: Option<KeyValueStorageType>,
+    /// Name of the storage backend to keep entries in, as understood by the
+    /// [`crate::store::ByteStoreProvider`]. `None` uses the provider's default
+    /// backend.
+    pub storage_type: Option<String>,
 
     /// Expire entries this many seconds after they were written. `null`
     /// keeps entries until they are deleted.
@@ -73,12 +74,6 @@ impl Config {
             return invalid("ttl_secs must be between 1 and MAX_DURATION_SECS (about 100 years)");
         }
         Ok(())
-    }
-}
-
-fn storage_error(source: key_value_storage::KeyValueStorageError) -> CacheError {
-    CacheError::Backend {
-        source: Box::new(source),
     }
 }
 
@@ -119,7 +114,7 @@ fn bump(counter: &AtomicU64) {
 
 /// A cache whose entries live in a key-value storage backend.
 pub struct PersistentCache {
-    storage: KeyValueStorageInstance,
+    storage: ByteStoreInstance,
     ttl: Option<Duration>,
     max_value_bytes: usize,
     counters: Counters,
@@ -135,7 +130,7 @@ impl std::fmt::Debug for PersistentCache {
 }
 
 impl PersistentCache {
-    pub fn new(storage: KeyValueStorageInstance, config: &Config) -> Result<Self> {
+    pub fn new(storage: ByteStoreInstance, config: &Config) -> Result<Self> {
         config.validate()?;
         Ok(Self {
             storage,
@@ -165,12 +160,7 @@ impl PersistentCache {
 
     /// Read and decode `key`, dropping it if it is expired or malformed.
     async fn load(&self, key: &CacheKey) -> Result<Option<(Vec<u8>, Option<SystemTime>)>> {
-        let Some(envelope) = self
-            .storage
-            .get(key.as_str())
-            .await
-            .map_err(storage_error)?
-        else {
+        let Some(envelope) = self.storage.get(key.as_str()).await? else {
             return Ok(None);
         };
 
@@ -180,18 +170,12 @@ impl PersistentCache {
             }
             Some(_) => {
                 bump(&self.counters.expirations);
-                self.storage
-                    .delete(key.as_str())
-                    .await
-                    .map_err(storage_error)?;
+                self.storage.delete(key.as_str()).await?;
                 Ok(None)
             }
             None => {
                 warn!("dropping malformed persistent cache entry {key}");
-                self.storage
-                    .delete(key.as_str())
-                    .await
-                    .map_err(storage_error)?;
+                self.storage.delete(key.as_str()).await?;
                 Ok(None)
             }
         }
@@ -220,23 +204,14 @@ impl Cache for PersistentCache {
         }
         let expires_at = self.ttl.map(|ttl| SystemTime::now() + ttl);
         self.storage
-            .set(
-                key.as_str(),
-                &encode(&value, expires_at),
-                SetParameters { overwrite: true },
-            )
-            .await
-            .map_err(storage_error)?;
+            .set(key.as_str(), &encode(&value, expires_at))
+            .await?;
         bump(&self.counters.insertions);
         Ok(())
     }
 
     async fn delete(&self, key: &CacheKey) -> Result<Option<Vec<u8>>> {
-        let previous = self
-            .storage
-            .delete(key.as_str())
-            .await
-            .map_err(storage_error)?;
+        let previous = self.storage.delete(key.as_str()).await?;
         Ok(previous
             .and_then(decode)
             .filter(|(_, expires_at)| !is_expired(*expires_at, SystemTime::now()))
@@ -244,14 +219,14 @@ impl Cache for PersistentCache {
     }
 
     async fn clear(&self) -> Result<()> {
-        for key in self.storage.list().await.map_err(storage_error)? {
-            self.storage.delete(&key).await.map_err(storage_error)?;
+        for key in self.storage.list().await? {
+            self.storage.delete(&key).await?;
         }
         Ok(())
     }
 
     async fn keys(&self) -> Result<Vec<CacheKey>> {
-        let keys = self.storage.list().await.map_err(storage_error)?;
+        let keys = self.storage.list().await?;
         // Anything else in the namespace was not written by this backend.
         Ok(keys
             .into_iter()
@@ -260,7 +235,7 @@ impl Cache for PersistentCache {
     }
 
     async fn stats(&self) -> Result<CacheStats> {
-        let entries = self.storage.list().await.map_err(storage_error)?.len();
+        let entries = self.storage.list().await?.len();
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         Ok(CacheStats {
             hits: load(&self.counters.hits),
@@ -288,15 +263,15 @@ impl Cache for PersistentCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use key_value_storage::memory::MemoryKeyValueStorage;
+    use crate::store::MemoryByteStore;
     use std::sync::Arc;
 
     fn key(k: &str) -> CacheKey {
         CacheKey::new(k).unwrap()
     }
 
-    fn cache(config: &Config) -> (PersistentCache, KeyValueStorageInstance) {
-        let storage: KeyValueStorageInstance = Arc::new(MemoryKeyValueStorage::default());
+    fn cache(config: &Config) -> (PersistentCache, ByteStoreInstance) {
+        let storage: ByteStoreInstance = Arc::new(MemoryByteStore::default());
         (
             PersistentCache::new(storage.clone(), config).unwrap(),
             storage,
@@ -334,20 +309,9 @@ mod tests {
     async fn expired_entries_are_dropped() {
         let (cache, storage) = cache(&Config::default());
         let past = SystemTime::now() - Duration::from_secs(1);
+        storage.set("old", &encode(b"v", Some(past))).await.unwrap();
         storage
-            .set(
-                "old",
-                &encode(b"v", Some(past)),
-                SetParameters { overwrite: true },
-            )
-            .await
-            .unwrap();
-        storage
-            .set(
-                "older",
-                &encode(b"v", Some(past)),
-                SetParameters { overwrite: true },
-            )
+            .set("older", &encode(b"v", Some(past)))
             .await
             .unwrap();
 
@@ -360,10 +324,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_entries_are_dropped() {
         let (cache, storage) = cache(&Config::default());
-        storage
-            .set("bad", b"not an envelope", SetParameters { overwrite: true })
-            .await
-            .unwrap();
+        storage.set("bad", b"not an envelope").await.unwrap();
         assert_eq!(cache.get(&key("bad")).await.unwrap(), None);
         assert!(storage.list().await.unwrap().is_empty());
     }

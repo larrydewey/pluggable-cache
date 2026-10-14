@@ -13,7 +13,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use cache::{
+use openssl::{
+    ec::{EcGroup, EcKey},
+    nid::Nid,
+    pkey::PKey,
+};
+use pluggable_cache::{
     oci::{
         bundle::{self, BundleEntries},
         store::OciStore,
@@ -22,11 +27,6 @@ use cache::{
     },
     preload::PreloadSource,
     CacheKey,
-};
-use openssl::{
-    ec::{EcGroup, EcKey},
-    nid::Nid,
-    pkey::PKey,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -78,7 +78,7 @@ impl Reply {
 }
 
 fn sha256(content: &[u8]) -> String {
-    cache::oci::Digest::of(content).to_string()
+    pluggable_cache::oci::Digest::of(content).to_string()
 }
 
 fn handle(state: &Mutex<Registry>, addr: SocketAddr, request: Request) -> Reply {
@@ -274,7 +274,7 @@ async fn push_pull_and_verify_through_registry() {
         .unwrap();
 
     // Pinning by digest works too, through the preload source.
-    let source = cache::oci::OciBundleSource::new(
+    let source = pluggable_cache::oci::OciBundleSource::new(
         "test".into(),
         Arc::new(pull),
         digest.to_string(),

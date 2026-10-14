@@ -2,12 +2,12 @@
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pluggable caching for Trustee components.
+//! Pluggable, namespaced caching.
 //!
 //! The crate has two layers:
 //!
 //! - [`lru::LruCache`] is a generic, dependency-free LRU map with optional
-//!   time-to-live and weight limit. It knows nothing about Trustee and can be
+//!   time-to-live and weight limit. It lives in the standalone `strict-lru` crate and can be
 //!   used on its own.
 //! - The [`Cache`] trait, its backends and [`CacheProvider`] form the pluggable
 //!   layer. Components ask a provider for a cache in their own namespace and
@@ -26,13 +26,11 @@ use serde::{Deserialize, Serialize};
 pub mod disabled;
 pub mod error;
 pub mod key;
-pub mod lru;
 pub mod memory;
-#[cfg(feature = "persistent")]
 pub mod persistent;
 pub mod preload;
 pub mod provider;
-#[cfg(feature = "persistent")]
+pub mod store;
 pub mod tiered;
 
 #[cfg(feature = "oci")]
@@ -41,6 +39,8 @@ pub mod oci;
 pub use error::{CacheError, Result};
 pub use key::CacheKey;
 pub use provider::{CacheProvider, ConfiguredCacheProvider};
+/// The LRU core, re-exported from the standalone [`strict_lru`] crate.
+pub use strict_lru as lru;
 
 /// Default time-to-live of cache entries: one week.
 pub const DEFAULT_TTL_SECS: u64 = 7 * 24 * 3600;
@@ -150,7 +150,6 @@ pub struct BackendConfig {
 
     /// Settings for [`CacheType::Persistent`] and the second tier of
     /// [`CacheType::Tiered`].
-    #[cfg(feature = "persistent")]
     pub persistent: persistent::Config,
 }
 
@@ -160,20 +159,11 @@ impl BackendConfig {
         match self.cache_type {
             CacheType::Memory => self.memory.validate(),
             CacheType::Disabled => Ok(()),
-            #[cfg(feature = "persistent")]
             CacheType::Persistent => self.persistent.validate(),
-            #[cfg(feature = "persistent")]
             CacheType::Tiered => {
                 self.memory.validate()?;
                 self.persistent.validate()
             }
-            #[cfg(not(feature = "persistent"))]
-            CacheType::Persistent | CacheType::Tiered => Err(CacheError::InvalidConfiguration {
-                message: format!(
-                    "cache type {:?} requires the `persistent` feature",
-                    self.cache_type
-                ),
-            }),
         }
     }
 }

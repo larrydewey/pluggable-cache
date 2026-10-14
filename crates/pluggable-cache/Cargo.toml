@@ -1,0 +1,37 @@
+[package]
+name = "pluggable-cache"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Pluggable, namespaced caches with an LRU core, persistent backends and signed OCI preload bundles"
+license = "Apache-2.0"
+repository = "https://github.com/larrydewey/pluggable-cache"
+readme = "README.md"
+
+[features]
+default = ["oci"]
+# Preloading from OCI registries and image layouts, with signature
+# verification, plus tooling to build, sign and push bundles.
+oci = ["dep:base64", "dep:hex", "dep:openssl", "dep:reqwest", "dep:serde_json", "dep:sha2"]
+
+[dependencies]
+async-trait = "0.1.88"
+base64 = { version = "0.23.0", optional = true }
+hex = { version = "0.4.3", optional = true }
+openssl = { version = "0.10.80", optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["default-tls", "json"], optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0.150", optional = true }
+sha2 = { version = "0.11", optional = true }
+strict-lru = { version = "0.1.0", path = "../strict-lru" }
+thiserror = "2.0"
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+base64 = "0.23.0"
+openssl = "0.10.80"
+rstest = "0.26.1"
+serde_json = "1.0.150"
+tempfile = "3.27.0"
+tokio = { version = "1", features = ["full"] }

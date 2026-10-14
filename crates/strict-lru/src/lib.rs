@@ -4,9 +4,9 @@
 
 //! A generic, bounded least-recently-used (LRU) cache.
 //!
-//! [`LruCache`] has no knowledge of Trustee and can hold any `K`/`V`. It is
+//! [`LruCache`] has no dependencies and can hold any `K`/`V`. It is
 //! deliberately single-threaded (`&mut self` for mutating lookups); wrap it in
-//! a lock to share it between threads, as [`crate::memory::MemoryCache`] does.
+//! a lock to share it between threads.
 //!
 //! Entries live in a slab (`Vec<Option<Node>>`) and are threaded onto a doubly
 //! linked recency list by index, so every operation is O(1) and the

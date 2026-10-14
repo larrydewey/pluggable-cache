@@ -1,23 +1,28 @@
-# Cache
+# pluggable-cache
 
-A generic LRU cache and a pluggable caching layer for Trustee components.
+Namespaced caches of opaque byte values with a pluggable backend, persistent and
+tiered storage, and signed OCI preload bundles. Built on the standalone
+[`strict-lru`](../strict-lru) crate. Developed for
+[Confidential Containers Trustee](https://github.com/confidential-containers/trustee),
+but it has no dependency on it.
 
 ## Overview
 
 The crate has two layers:
 
-- **`lru::LruCache<K, V>`**: a generic, bounded least-recently-used map with an
-  optional time-to-live and an optional weight limit (e.g. bytes). It has no
-  Trustee-specific types or dependencies, uses no `unsafe`, and every
-  operation is O(1). It is single-threaded; wrap it in a lock to share it.
+- **`lru::LruCache<K, V>`** (re-exported from `strict-lru`): a generic,
+  bounded least-recently-used map with an optional time-to-live and an
+  optional weight limit (e.g. bytes). It has no dependencies, uses no
+  `unsafe`, and every operation is O(1). It is single-threaded; wrap it in a
+  lock to share it.
 - **The pluggable layer**: the `Cache` trait, its backends, `CacheProvider`
   and pluggable preload sources. A component asks a provider for a cache in its
-  own namespace and stays unaware of the backend the operator configured. This
-  mirrors [`key-value-storage`](../key-value-storage/README.md) and its
-  `StorageProvider`.
+  own namespace and stays unaware of the backend the operator configured.
+  Durable storage is supplied by the host through the `ByteStore` and
+  `ByteStoreProvider` traits.
 
 ```rust
-let provider = ConfiguredCacheProvider::new(config, Some(storage_provider))?;
+let provider = ConfiguredCacheProvider::new(config, Some(byte_store_provider))?;
 let cache = provider.get_or_register("snp_vcek").await?;
 
 let key = CacheKey::new("Milan/0a1b2c/bl03_tee00_snp08_ucode115")?;
@@ -31,6 +36,7 @@ Every extension point is a trait, so nothing is tied to one vendor or service:
 | Extension point  | Trait            | Implementations in this crate                              |
 |------------------|------------------|------------------------------------------------------------|
 | Cache backend    | `Cache`          | `MemoryCache`, `PersistentCache`, `TieredCache`, `DisabledCache` |
+| Durable storage  | `ByteStore`, `ByteStoreProvider` | `MemoryByteStore` (tests); the host adapts its own storage |
 | Namespace source | `CacheProvider`  | `ConfiguredCacheProvider`                                  |
 | Seeding          | `PreloadSource`  | `DirectorySource`, `OciBundleSource`                       |
 | Bundle trust     | `BundleVerifier` | `CosignKeyVerifier`, `Unverified`                          |
@@ -77,7 +83,7 @@ Every extension point is a trait, so nothing is tied to one vendor or service:
 | `cache_type` | Description |
 |--------------|-------------|
 | `Memory`     | Bounded in-process LRU cache with time-to-live. Default. |
-| `Persistent` | Entries in a `key-value-storage` backend (`LocalFs`, `LocalJson`, `Postgres`, `Redis`, ...), in the storage namespace `cache_<namespace>`. Survives restarts; with a shared backend, entries are shared between replicas. Bounded by time-to-live only. |
+| `Persistent` | Entries in a `ByteStore` supplied by the host, in the storage namespace `cache_<namespace>`. Survives restarts; with a shared store, entries are shared between replicas. Bounded by time-to-live only. |
 | `Tiered`     | `Memory` in front of `Persistent`: reads are served from memory when possible, writes go to both. An entry promoted from the persistent tier never outlives its expiry there. |
 | `Disabled`   | Stores nothing; every lookup misses. Switches caching off. |
 
@@ -86,10 +92,8 @@ opaque bytes so that out-of-process backends work without changing
 consumers.
 
 > [!Note]
-> With the `Postgres` storage backend, create a table named
-> `cache_<namespace>` (same schema as in
-> [`set-up.sql`](../key-value-storage/src/postgres/set-up.sql)) for every
-> persistent namespace.
+> Stores backed by a database may need a table or collection per
+> namespace, named `cache_<namespace>`, created ahead of time.
 
 ## Configuration
 
@@ -126,7 +130,7 @@ under `namespaces` replace it for individual namespaces.
 | `memory.max_bytes`    | Total key and value bytes per namespace before LRU eviction | unbounded |
 | `memory.ttl_secs`     | Expire entries this long after writing; `null` disables expiry | `604800` (7 days) |
 | `memory.max_value_bytes` | Reject larger values | `1048576` |
-| `persistent.storage_type` | `key-value-storage` backend to use | the storage provider's default |
+| `persistent.storage_type` | Name of the storage backend, checked by `ByteStoreProvider::validate_backend` at construction | the provider's default |
 | `persistent.ttl_secs` | As `memory.ttl_secs` | `604800` |
 | `persistent.max_value_bytes` | As `memory.max_value_bytes` | `1048576` |
 | `namespaces`          | Map of namespace to a backend configuration replacing the default | `{}` |
@@ -204,43 +208,8 @@ config, and one layer per entry with media type
 annotations `io.confidential-containers.trustee.cache.namespace` and
 `io.confidential-containers.trustee.cache.key`.
 
-## Air-gapped Workflow
+## Bundle compatibility
 
-On a connected machine, with the `trustee` CLI:
-
-```bash
-# Collect entries, e.g. the VCEKs of the hosts' SNP reports.
-trustee cache fetch-vcek --report host1-report.bin --dir ./cache
-trustee cache fetch-vcek --report host2-report.bin --dir ./cache
-
-# Pack and sign them. `cosign generate-key-pair` keys work too.
-trustee cache bundle keygen --output bundle.key
-trustee cache bundle create --dir ./cache --layout ./bundle --tag v1
-trustee cache bundle sign --layout ./bundle --tag v1 --key bundle.key \
-    --identity registry.internal/trustee/cache
-```
-
-Carry `./bundle` (or a `trustee cache bundle pull` of it) into the
-air-gapped environment, then either point an `OciLayout` source at it, or push
-it to the internal registry and use an `OciRegistry` source:
-
-```bash
-trustee cache bundle push --layout ./bundle --tag v1 \
-    --to registry.internal/trustee/cache:v1 \
-    --username robot --password-file ./password
-trustee cache bundle verify --from registry.internal/trustee/cache:v1 \
-    --public-key bundle.pub
-```
-
-Alternatively, seed a running KBS through its admin API with
-`kbs-client config cache upload --dir ./cache`.
-
-## Consumers
-
-| Namespace               | Component         | Content                       | Behavior |
-|-------------------------|-------------------|-------------------------------|----------|
-| `snp_vcek`              | SNP verifier      | VCEKs, keyed `<Milan\|Genoa\|Turin>/<hw_id>/<tcb>` | Cache first; verified against the AMD root before use and before caching. Not used when the chip ID is masked. |
-| `intel_dcap_collateral` | TDX, SGX, Azure TDX verifiers | PCS/PCCS collateral | Cache first; verified by the quote verification library. A verification that fails with cached collateral is retried once with fresh collateral, which replaces the cached one. |
-| `hygon_csv_hsk_cek`     | Hygon CSV verifier | HSK/CEK certificates, keyed by chip serial number | Cache first; verified against the HRK before use and before caching. |
-| `nvidia_nras_jwks`      | NVIDIA remote verifier | NRAS token signing keys | Cache first; refreshed when a token is signed by an unknown key. Trust anchor. |
-| `kbs_jwks`              | KBS token and admin verifiers | Remote JWK sets | Fetch first; the cached copy is only used when the source is unreachable. Trust anchor. |
+The OCI media types and annotations still carry the `trustee` prefix
+(`application/vnd.confidential-containers.trustee.cache-bundle.v1`, ...) so
+that bundles created by earlier Trustee tooling keep working.
